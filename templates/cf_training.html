@@ -1,0 +1,67 @@
+{% extends "layout/basic.html" %}
+{% block content %}
+<div id="cf-training" data-coach="{{ 'true' if cfCoach else 'false' }}" data-entry="{{ url('cf_training') }}" data-api="{{ url('cf_training_api') }}" data-token="{{ cfToken }}" class="row">
+  <style>{% raw %}
+    #cf-training{max-width:1180px;margin:auto;padding:24px 16px;color:#243248}
+    #cf-training h1{font-size:28px;font-weight:700;margin:0 0 8px}#cf-training h2{font-size:19px;font-weight:650;margin:0 0 14px}
+    #cf-training .ct-muted{color:#65748b;font-size:13px;line-height:1.7}#cf-training .ct-card{background:#fff;border:1px solid #dfe6ee;border-radius:12px;padding:22px;margin:18px 0}
+    #cf-training .ct-flex{display:flex;gap:12px;align-items:center;flex-wrap:wrap}#cf-training .ct-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+    #cf-training input:not([type=checkbox]),#cf-training select{border:1px solid #ccd6e2;border-radius:6px;padding:8px 10px;font:inherit;max-width:100%;background:white;color:#243248}
+    #cf-training button{border:0;border-radius:6px;padding:8px 14px;background:#176b71;color:white;cursor:pointer;font:inherit}#cf-training button.secondary{background:#eaf1f5;color:#244451}#cf-training button:disabled{opacity:.5;cursor:wait}
+    #cf-training table{width:100%;border-collapse:collapse;font-size:14px}#cf-training td,#cf-training th{padding:10px 8px;border-bottom:1px solid #e6ecf1;text-align:left;vertical-align:top}
+    #cf-training .ct-scroll{overflow-x:auto}#cf-training .ct-pill{display:inline-block;padding:2px 8px;border-radius:12px;background:#edf4f5;font-size:12px}
+    #cf-training .ct-error{color:#a82525;background:#fff0ef;padding:12px;border-radius:8px}#cf-training .ct-success{background:#e8f5ef;padding:12px;border-radius:8px}
+    #cf-training .ct-tabs{display:flex;gap:8px;margin:20px 0;flex-wrap:wrap}#cf-training .ct-hidden{display:none}#cf-training label{display:inline-block;margin:5px 8px 5px 0}#cf-training a{color:#176b71}
+    #cf-training details{margin:8px 0}#cf-training summary{cursor:pointer}#cf-training .ct-score{font-size:24px;font-weight:700}
+    #cf-training .ct-stats{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 14px}
+    #cf-training .ct-stat{flex:1;min-width:130px;border:1px solid #dfe6ee;border-radius:8px;padding:10px 14px;background:#fafcff}
+    #cf-training .ct-stat p{margin:0 0 2px}#cf-training .ct-stat strong{font-size:22px;line-height:1.3}
+    #cf-training .ct-chart{position:relative;overflow:hidden}
+    #cf-training .ct-chart svg{display:block;max-width:100%}
+    #cf-training .ct-tip{position:absolute;z-index:5;background:#fff;border:1px solid #ccd6e2;border-radius:8px;box-shadow:0 4px 14px rgba(20,35,60,.18);padding:10px 12px;font-size:13px;max-width:min(270px,90%);width:max-content}
+    #cf-training .ct-tip h4{margin:0 0 6px;font-size:13px}
+    #cf-training .ct-hot{cursor:pointer}
+    #cf-training .ct-problem-stats-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px}
+    #cf-training .ct-stats-bars-scroll{overflow-x:auto;max-width:100%}
+    #cf-training .ct-stats-chart{position:relative;min-height:220px}
+    #cf-training .ct-stats-ring-layout{display:grid;grid-template-columns:minmax(180px,1fr) minmax(150px,1fr);gap:14px;align-items:center}
+    #cf-training .ct-stats-ring{width:100%;max-width:280px;margin:auto;overflow:visible}
+    #cf-training .ct-stats-ring circle[data-stats-index],#cf-training rect[data-stats-index]{cursor:pointer}
+    #cf-training [data-stats-index]:focus{outline:2px solid #176b71;outline-offset:2px}
+    #cf-training .ct-stats-legend{max-height:300px;overflow-y:auto;min-width:0}
+    #cf-training .ct-stats-legend-row{display:grid;grid-template-columns:12px minmax(0,1fr) auto;gap:7px;align-items:start;padding:5px 0;font-size:13px}
+    #cf-training .ct-stats-swatch{width:11px;height:11px;margin-top:3px;border-radius:3px}
+    #cf-training .ct-stats-tip{position:absolute;z-index:6;display:none;background:#fff;border:1px solid #ccd6e2;border-radius:8px;box-shadow:0 4px 14px rgba(20,35,60,.18);padding:8px 10px;font-size:13px;max-width:min(260px,90%);pointer-events:none}
+    @media(max-width:900px){#cf-training .ct-problem-stats-grid{grid-template-columns:minmax(0,1fr)}}
+    @media(max-width:600px){#cf-training .ct-stats-ring-layout{grid-template-columns:minmax(0,1fr)}#cf-training .ct-stats-legend{max-height:240px}}
+    #cf-training .ct-linklike{background:none;border:0;border-radius:0;padding:0;color:#176b71;text-decoration:underline;cursor:pointer;font:inherit}
+    #cf-training .ct-up{color:#0a7d32;font-weight:650}#cf-training .ct-down{color:#b3261e;font-weight:650}#cf-training .ct-flat{color:#65748b;font-weight:650}
+    #cf-training dialog{box-sizing:border-box;width:min(640px,calc(100vw - 28px));max-height:85vh;overflow:auto;border:1px solid #dfe6ee;border-radius:14px;padding:24px;color:#243248;background:white;box-shadow:0 20px 80px #10203044}
+    #cf-training dialog::backdrop{background:#15283a80}#cf-training dialog label{display:block}#cf-training dialog input:not([type=checkbox]):not([type=radio]){box-sizing:border-box;width:100%}#cf-training .ct-dialog-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:24px}#cf-training .ct-person{padding:12px 0;border-bottom:1px solid #e6ecf1;display:flex;justify-content:space-between;align-items:center;gap:12px}#cf-training h3{font-size:16px;margin:24px 0 12px}
+    @media(max-width:600px){#cf-training{padding:12px 6px}#cf-training .ct-card{padding:14px}#cf-training td,#cf-training th{padding:8px 5px}#cf-training .ct-stat strong{font-size:18px}}
+  {% endraw %}</style>
+  <div class="ct-flex" style="justify-content:space-between"><div><h1>{{ 'CF 训练管理' if cfCoach else '我的 CF 训练' }}</h1><p class="ct-muted">{% if cfCoach %}管理学生与班级，组织训练并结算成绩。{% else %}在 Codeforces 提交，在这里参加训练并记录成长。{% endif %}</p></div><button id="ct-refresh" class="secondary">刷新状态</button></div>
+  <div id="ct-message" role="status" aria-live="polite"></div>
+  <nav class="ct-tabs" aria-label="训练导航"><button data-tab="home">{{ '训练管理' if cfCoach else '我的训练' }}</button>{% if cfCoach %}<button data-tab="coach" class="secondary">学生管理</button><button data-tab="select" class="secondary">选赛与组赛</button>{% endif %}<button data-tab="classes" class="secondary">班级管理</button><button data-tab="history" class="secondary">Rating 记录</button></nav>
+  <main>
+    <section id="ct-home">{% if not cfCoach %}<div class="ct-card"><h2>我的 CF 账号</h2><div id="ct-account"></div><form id="ct-bind" class="ct-flex"><label>CF handle <input name="handle" required maxlength="24" placeholder="输入你的 CF handle"></label><button>绑定并同步</button></form><p class="ct-muted">学生仅可绑定一次，更换账号请联系教练。首次同步会读取公开提交历史。账号由教练确认归属；未发现记录不代表一定没见过题目。</p><details><summary>补充我已见过的题目或比赛</summary><form id="ct-seen" class="ct-flex"><select name="kind"><option value="problem">题目</option><option value="contest">比赛</option></select><input name="value" required placeholder="2000/C 或比赛 ID"><button class="secondary">标记已接触</button></form><div id="ct-seen-list"></div></details></div><div class="ct-card"><h2>我的 CF 题目记录</h2><p class="ct-muted">来自当前绑定账号的公开提交。曾 AC 的题目计入已通过，其余有提交的题目计入尝试过的题目；同步中可能只显示部分记录。</p><div id="ct-problems"></div></div><div class="ct-card" id="ct-problem-stats-card"><h2>已解决题目统计</h2><div id="ct-problem-stats"><p class="ct-muted">统计加载中…</p></div></div><div class="ct-card"><h2>Rating 成长曲线</h2><div id="ct-rating"></div></div>{% endif %}<div class="ct-card"><h2>训练场次</h2><div id="ct-runs"></div></div></section>
+    {% if cfCoach %}
+    <section id="ct-coach" class="ct-hidden"><div class="ct-card"><h2>学生管理</h2><p class="ct-muted">勾选学生后可添加到一个或多个班级。确认账号表示你已核对该学生与 CF 账号的对应关系。</p><div id="ct-students" class="ct-scroll"></div><div class="ct-flex"><button type="button" id="ct-add-to-classes">添加到班级</button><button type="button" id="ct-sync-all" class="secondary">同步所选学生</button></div></div><div class="ct-card"><h2>后台任务</h2><div id="ct-jobs"></div></div></section>
+    <section id="ct-select" class="ct-hidden"><div class="ct-card"><h2>选择班级并筛选比赛</h2><p class="ct-muted">先选择一个你有权管理的班级；比赛筛选和训练名单都使用该班级当前成员。</p><label>参赛班级 <select id="ct-contest-group"><option value="">选择班级</option></select></label><form id="ct-discover" class="ct-flex"><label>搜索比赛 <input name="query" type="search" maxlength="200" placeholder="比赛名称、Div. 2 或 ID"></label><select name="mode"><option value="clear">仅无已知接触记录</option><option value="all">全部，优先少量换题</option></select><label>每页 <select name="pageSize"><option value="20">20 场</option><option value="50">50 场</option><option value="100">100 场</option></select></label><button>搜索 / 筛选</button><button type="button" id="ct-catalog" class="secondary">同步 CF 比赛与题库</button></form><div id="ct-candidates" class="ct-scroll"></div><div id="ct-pagination" class="ct-flex" aria-live="polite"></div></div><div class="ct-card"><h2>导入并创建训练</h2><form id="ct-import" class="ct-flex"><input name="contestId" required placeholder="CF 比赛 ID 或链接"><button>导入历史参照榜</button></form><p class="ct-muted">导入任务完成后创建草稿。公开评分算法估计未恢复历史新账号内部评分；特殊计分规则应先核对。</p><form id="ct-create"><div class="ct-grid"><label>训练名称 <input name="title" required placeholder="周末训练"></label><label>原比赛 ID <input name="contestId" required type="number" min="1" max="99999"></label><label>开赛时间（本机时区） <input name="startAt" type="datetime-local" required></label><label>CF 时间衰减参数（分钟） <input name="decayMinutes" type="number" value="250" min="1" max="2000"></label><label>CF 错误提交扣分 <input name="wrongPenalty" type="number" value="50" min="0" max="1000"></label><label>ICPC 错误提交罚时（分钟） <input name="icpcPenalty" type="number" value="10" min="0" max="120"></label></div><label><input name="rated" type="checkbox" checked> 计入本地 Rating</label><button>为当前班级创建草稿</button></form></div></section>
+    {% endif %}
+    <section id="ct-classes" class="ct-hidden">
+      <div class="ct-card"><h2>班级管理</h2><div id="ct-class-invites"></div><div class="ct-flex"><label>当前班级 <select id="ct-groups"><option value="">选择班级</option></select></label><button type="button" id="ct-class-refresh" class="secondary">刷新班级榜</button><button type="button" id="ct-class-new" class="secondary">新建班级</button></div><p class="ct-muted">按本站训练 Rating 排序，同分并列；未初始化评分的学生列在最后。题数为当前 CF 账号全部已同步历史中的去重 AC 题数。</p><div id="ct-class-board" class="ct-scroll" aria-live="polite"></div></div>
+      <div id="ct-class-editor" class="ct-card ct-hidden"><h2>班级设置</h2><form id="ct-group" class="ct-flex"><label>班级名称 <input name="name" required maxlength="100"></label><button id="ct-class-save">保存名称</button></form>
+        <h3>学生成员</h3><form id="ct-class-members-add" class="ct-flex"><label>学生 UID <input name="members" required placeholder="多个 UID 用逗号分隔"></label><button>添加学生</button></form><div id="ct-class-members" class="ct-scroll"></div><button type="button" id="ct-class-remove-selected" class="secondary" disabled>移除所选学生</button>
+        <h3>管理员</h3><div id="ct-class-admins" class="ct-scroll"></div><div id="ct-class-owner"></div>
+        <div class="ct-flex" style="margin-top:20px"><button type="button" id="ct-class-transfer-open" class="secondary">转让班级</button><button type="button" id="ct-delete-group" class="secondary" disabled>删除班级</button></div>
+      </div>
+    </section>
+    <section id="ct-history" class="ct-hidden"><div class="ct-card"><h2>本地 Rating 历史</h2><p class="ct-muted">初始评分取首次成功同步时的 CF rating，之后保留本地训练变化；CF 未评级账号暂用 1400。每位学生独立对比同一历史参照池；这是训练估计，与官方 CF rating 分开。撤销结算后，后续本地评分按比赛顺序重算。</p><div id="ct-ledger" class="ct-scroll"></div>{% if cfCoach %}<button id="ct-export" class="secondary">导出训练档案 JSON</button>{% endif %}</div></section>
+    <section id="ct-detail" class="ct-hidden"><div class="ct-card"><div class="ct-flex"><button id="ct-back" class="secondary">返回训练列表</button><h2 id="ct-run-title"></h2></div><div id="ct-run-body"></div></div></section>
+  </main>
+  <dialog id="ct-class-dialog" aria-labelledby="ct-class-dialog-title"><div class="ct-flex" style="justify-content:space-between"><h2 id="ct-class-dialog-title"></h2><button type="button" id="ct-dialog-close" class="secondary" aria-label="关闭弹窗">关闭</button></div><div id="ct-dialog-body"></div><p id="ct-dialog-error" class="ct-error ct-hidden" role="alert"></p></dialog>
+</div>
+<script>{% include "cf_training_app.html" %}</script>
+{% endblock %}
+

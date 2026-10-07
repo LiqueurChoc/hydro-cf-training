@@ -1,0 +1,4 @@
+{
+  "epoch": 1,
+  "collections": ["cftrain_state", "cftrain_submission", "cftrain_catalog", "cftrain_reference", "cftrain_job", "cftrain_lock"]
+}

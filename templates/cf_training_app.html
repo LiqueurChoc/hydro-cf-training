@@ -1,0 +1,761 @@
+(() => {
+  'use strict';
+  const root = document.getElementById('cf-training');
+  const $ = id => document.getElementById(`ct-${id}`);
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  const when = value => value ? new Date(value).toLocaleString() : '尚未同步';
+  const key = p => `${p.contestId}/${p.index}`;
+  const link = p => `<a target="_blank" rel="noopener" href="https://codeforces.com/problemset/problem/${Number(p.contestId)}/${encodeURIComponent(p.index)}">${esc(key(p))} ${esc(p.name)}</a>`;
+  const statuses = { draft:'草稿', published:'已发布', settled:'已结算', cancelled:'已取消', queued:'排队中', running:'执行中', done:'完成', failed:'失败', syncing:'同步中', ready:'已同步' };
+  const jobKinds = { sync:'学生历史同步', import:'历史参照榜导入', catalog:'题库同步' };
+  function ruleSummary(rules) {
+    const number = field => Number.isFinite(rules?.[field]) ? rules[field] : '未记录';
+    if (rules?.type === 'CF') return `CF 计分：时间衰减参数 ${number('decayMinutes')} 分钟；最后一次有效提交决定结果，此前每次有效提交扣 ${number('wrongPenalty')} 分；通过后最低得分为基础分的 ${Number.isFinite(rules.minimumFraction) ? rules.minimumFraction * 100 + '%' : '未记录比例'}。`;
+    if (rules?.type === 'ICPC') return `ICPC 计分：按解题数、总罚时排序；每次有效错误提交罚时 ${number('icpcPenalty')} 分钟。`;
+    return '计分规则未记录，请联系教练核对。';
+  }
+  let data, currentRun, previewToken, discovery, selected = new Set();
+  let discoverySeq = 0;
+  let selectedGroupId = '', problemStatus = 'all', problemPage = 1;
+  let classSeq = 0, classPreferenceLoaded = false, dialogState = null, dialogSeq = 0;
+  let refreshSeq = 0, problemsSeq = 0, problemListBinding = null, runSeq = 0;
+  let problemStatsSeq = 0, problemStatsSnapshot = null, problemStatsTipPinned = null, problemStatsTimer = null;
+  async function api(action, args = {}, post = false) {
+    const url = new URL(root.dataset.api, location.origin);
+    if (!post) for (const [k, v] of Object.entries({ action, ...args })) url.searchParams.set(k, v);
+    const response = await fetch(url, post ? { method:'POST', credentials:'same-origin',
+      headers:{ 'Content-Type':'application/json', 'x-cf-training-csrf':root.dataset.token }, body:JSON.stringify({ action, ...args }) } : { credentials:'same-origin' });
+    if (!response.ok) throw new Error(`请求失败（${response.status}），请检查登录和权限`);
+    const body = await response.json();
+    if (!body.ok) throw new Error(body.error || '操作失败');
+    return body.result;
+  }
+  function message(text, error = false) { if (error) { window.alert(text); return; } $('message').className = 'ct-success'; $('message').textContent = text; }
+  function tab(name) {
+    for (const section of root.querySelectorAll('main > section')) section.classList.toggle('ct-hidden', section.id !== `ct-${name}`);
+    for (const button of root.querySelectorAll('[data-tab]')) {
+      button.classList.toggle('secondary', button.dataset.tab !== name);
+      button.setAttribute('aria-current', button.dataset.tab === name ? 'page' : 'false');
+    }
+    // Leaving the detail view invalidates pending detail loads: currentRun is only
+    // set while a run's content is actually rendered, so writes always target what
+    // the user currently sees.
+    if (name !== 'detail') { runSeq++; currentRun = null; previewToken = null; }
+    if (name === 'home') drawRatingChart();
+  }
+  function uids() { if (!selected.size) throw new Error('请先在学生管理勾选参赛学生'); return [...selected]; }
+  const ratingPending = state => state.ratingStatus && state.ratingStatus !== 'ready';
+  const ratingMessage = state => state.ratingStatus === 'failed' ? (state.ratingError || 'Rating 计算失败，请稍后刷新重试')
+    : state.ratingStatus === 'busy' ? 'Rating 计算队列繁忙，请稍后刷新重试' : 'Rating 正在后台计算，请稍后刷新状态或榜单';
+  const ratingValue = (value, state = data) => ratingPending(state)
+    ? ({ failed: '计算失败', busy: '等待计算' }[state.ratingStatus] || '计算中') : value ?? '待同步';
+  function baselineLabel(a) {
+    const b = a.ratingBaseline;
+    if (!b) return '初始评分等待 CF 同步';
+    if (b.source === 'legacy') return `保留旧版训练起点 ${b.rating}`;
+    if (b.source === 'unrated-default') return `CF 未评级，默认起点 ${b.rating}`;
+    return `初始评分 ${b.rating}，来自 ${b.handle} 的 CF rating（${when(b.at)}）`;
+  }
+  // Codeforces 官方段位分段；项目未定义其他段位规则，图表沿用该划分与配色。
+  const RATING_BANDS = [[1200, '#808080', 'Newbie'], [1400, '#008000', 'Pupil'], [1600, '#03a89e', 'Specialist'],
+    [1900, '#0000ff', 'Expert'], [2100, '#aa00aa', 'Candidate Master'], [2400, '#ff8c00', 'Master'], [Infinity, '#ff0000', 'Grandmaster']];
+  const bandOf = r => RATING_BANDS.find(b => r < b[0]) || RATING_BANDS[RATING_BANDS.length - 1];
+  const pad2 = n => String(n).padStart(2, '0');
+  const fmtDate = t => { const d = new Date(t); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+  const fmtDT = t => { const d = new Date(t); return `${fmtDate(t)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`; };
+  const signed = d => d > 0 ? `+${d}` : String(d);
+  const deltaClass = d => d > 0 ? 'ct-up' : d < 0 ? 'ct-down' : 'ct-flat';
+  let ratingSnapshot = null, ratingTimer = null, ratingTipPinned = -1;
+  function renderRating(mine) {
+    const host = $('rating');
+    if (!host) return;
+    ratingTipPinned = -1;
+    if (!mine) {
+      ratingSnapshot = null;
+      host.innerHTML = '<p class="ct-muted">绑定 CF 账号并完成同步后，这里会展示你的本地 Rating 成长曲线。</p>';
+      return;
+    }
+    if (ratingPending(data)) {
+      ratingSnapshot = null;
+      host.innerHTML = `<p class="ct-muted" role="status">${esc(ratingMessage(data))}</p>`;
+      return;
+    }
+    // ledger 已只含参与 Rating 结算（非撤销）的比赛；按结束时间升序排列。
+    const events = data.ledger.map(e => {
+      const ch = (e.changes || []).find(x => x.uid === data.uid);
+      return ch && e.endAt ? { runId: e.runId, title: e.title, changed: e.changed, endAt: e.endAt, ...ch } : null;
+    }).filter(Boolean).sort((a, b) => a.endAt - b.endAt || a.runId.localeCompare(b.runId));
+    const baseline = mine.ratingBaseline ? mine.ratingBaseline.rating : null;
+    const current = mine.rating;
+    // A：固定起点与当前有效重放结果的最大值；撤销后不保留旧峰值。
+    const values = [...(baseline != null ? [baseline] : []), ...events.map(e => e.newRating)];
+    const best = values.length ? Math.max(...values) : null;
+    const last = events[events.length - 1] || null;
+    const band = current != null ? bandOf(current) : null;
+    const bestBand = best != null ? bandOf(best) : null;
+    const stats = `<div class="ct-stats">
+      <div class="ct-stat"><p class="ct-muted">当前 Rating</p><strong ${band ? `style="color:${band[1]}"` : ''}>${current ?? '待同步'}</strong>${band ? ` <span class="ct-muted">${band[2]}</span>` : ''}</div>
+      <div class="ct-stat"><p class="ct-muted">有效训练历史最高</p><strong ${bestBand ? `style="color:${bestBand[1]}"` : ''}>${best ?? '待同步'}</strong>${bestBand ? ` <span class="ct-muted">${bestBand[2]}</span>` : ''}</div>
+      <div class="ct-stat"><p class="ct-muted">最近变化</p>${last ? `<strong class="${deltaClass(last.delta)}">${signed(last.delta)}</strong> <span class="ct-muted">${esc(last.title)}</span>` : '<strong class="ct-flat">—</strong> <span class="ct-muted">尚无计分比赛</span>'}</div>
+    </div><p class="ct-muted">最高值包含固定起点；撤销错误结算后按有效训练重算，可能下降。</p>`;
+    if (!events.length) {
+      ratingSnapshot = null;
+      host.innerHTML = `${stats}<p class="ct-muted">${current == null ? '初始评分等待 CF 同步，同步完成后会显示起点。' : `当前 ${current} 分为固定起点。还没有计入本地 Rating 的训练记录；完成首场计分训练并结算后，这里会出现第一个数据点。`}</p>`;
+      return;
+    }
+    ratingSnapshot = { events, baseline };
+    host.innerHTML = `${stats}<div class="ct-chart" id="ct-rating-chart" role="img" aria-label="本地 Rating 折线图，共 ${events.length} 场计分比赛"></div>${ratingDetails(events)}`;
+    drawRatingChart();
+  }
+  function ratingDetails(events) {
+    return `<details><summary>比赛明细（${events.length} 场）</summary><div class="ct-scroll"><table><thead><tr><th>时间</th><th>比赛</th><th>赛后 Rating</th><th>本场变化</th></tr></thead><tbody>${events.slice().reverse().map(e => `<tr><td>${fmtDT(e.endAt)}</td><td><button class="ct-linklike" data-open="${e.runId}">${esc(e.title)}</button>${e.changed ? ' <span class="ct-pill">换题</span>' : ''}</td><td><strong style="color:${bandOf(e.newRating)[1]}">${e.newRating}</strong></td><td class="${deltaClass(e.delta)}">${signed(e.delta)}</td></tr>`).join('')}</tbody></table></div></details>`;
+  }
+  function drawRatingChart() {
+    if (!ratingSnapshot) return;
+    const chart = $('rating-chart');
+    if (!chart) return;
+    const { events, baseline } = ratingSnapshot;
+    const width = Math.max(300, Math.min(760, chart.clientWidth || 640));
+    const height = width < 480 ? 210 : 250;
+    const pad = width < 480 ? { l: 40, r: 12, t: 12, b: 26 } : { l: 46, r: 14, t: 14, b: 30 };
+    const values = events.flatMap(e => [e.oldRating, e.newRating]);
+    if (baseline != null) values.push(baseline);
+    let lo = Math.min(...values), hi = Math.max(...values);
+    if (hi - lo < 120) { const mid = (hi + lo) / 2; lo = mid - 60; hi = mid + 60; }
+    const step = hi - lo <= 400 ? 100 : hi - lo <= 900 ? 200 : 400;
+    lo = Math.floor((lo - 16) / step) * step;
+    hi = Math.ceil((hi + 16) / step) * step;
+    const tMin = events[0].endAt, span = events[events.length - 1].endAt - tMin;
+    const innerL = pad.l + 16, innerR = width - pad.r - 16;
+    const X = t => span > 0 ? innerL + (t - tMin) / span * (innerR - innerL) : (innerL + innerR) / 2;
+    const Y = r => pad.t + (hi - r) / (hi - lo) * (height - pad.t - pad.b);
+    const parts = [];
+    for (let i = 0; i < RATING_BANDS.length; i++) {
+      const top = Math.max(lo, i ? RATING_BANDS[i - 1][0] : lo);
+      const bottom = Math.min(hi, RATING_BANDS[i][0]);
+      if (bottom > top) parts.push(`<rect x="${pad.l}" y="${Y(bottom).toFixed(1)}" width="${width - pad.l - pad.r}" height="${(Y(top) - Y(bottom)).toFixed(1)}" fill="${RATING_BANDS[i][1]}" opacity="0.08"/>`);
+    }
+    if (baseline != null && baseline >= lo && baseline <= hi) parts.push(`<line x1="${pad.l}" x2="${width - pad.r}" y1="${Y(baseline).toFixed(1)}" y2="${Y(baseline).toFixed(1)}" stroke="#8a97a8" stroke-dasharray="5 4" stroke-width="1"/><text x="${pad.l + 5}" y="${(Y(baseline) - 4).toFixed(1)}" font-size="10" fill="#8a97a8">初始 ${baseline}</text>`);
+    parts.push(`<line x1="${pad.l}" x2="${width - pad.r}" y1="${height - pad.b}" y2="${height - pad.b}" stroke="#dfe6ee"/>`);
+    if (events.length > 1) parts.push(`<polyline points="${events.map(e => `${X(e.endAt).toFixed(1)},${Y(e.newRating).toFixed(1)}`).join(' ')}" fill="none" stroke="#3c4c63" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`);
+    events.forEach((e, i) => parts.push(`<circle cx="${X(e.endAt).toFixed(1)}" cy="${Y(e.newRating).toFixed(1)}" r="4.5" fill="${bandOf(e.newRating)[1]}" stroke="#fff" stroke-width="1.5"/><circle data-node="${i}" cx="${X(e.endAt).toFixed(1)}" cy="${Y(e.newRating).toFixed(1)}" r="14" fill="transparent" class="ct-hot"><title>${esc(e.title)}</title></circle>`));
+    const ticks = [];
+    for (let r = lo; r <= hi; r += step) ticks.push(`<text x="${pad.l - 6}" y="${(Y(r) + 4).toFixed(1)}" text-anchor="end" font-size="11" fill="#65748b">${r}</text>`);
+    if (span > 0) {
+      const n = Math.min(width < 480 ? 3 : 5, events.length);
+      for (let i = 0; i < n; i++) {
+        const anchor = i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle';
+        ticks.push(`<text x="${X(tMin + span * i / (n - 1)).toFixed(1)}" y="${height - 8}" text-anchor="${anchor}" font-size="11" fill="#65748b">${fmtDate(tMin + span * i / (n - 1))}</text>`);
+      }
+    } else ticks.push(`<text x="${X(tMin).toFixed(1)}" y="${height - 8}" text-anchor="middle" font-size="11" fill="#65748b">${fmtDate(tMin)}</text>`);
+    chart.innerHTML = `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${parts.join('')}${ticks.join('')}</svg>`;
+    bindRatingChart();
+  }
+  function showRatingTip(i, node, pin) {
+    if (!ratingSnapshot) return;
+    const e = ratingSnapshot.events[i];
+    const chart = $('rating-chart');
+    if (!e || !chart) return;
+    let tip = $('rating-tip');
+    if (!tip) { tip = document.createElement('div'); tip.id = 'ct-rating-tip'; tip.className = 'ct-tip'; chart.appendChild(tip); }
+    const band = bandOf(e.newRating);
+    tip.innerHTML = `<h4>${esc(e.title)}${e.changed ? ' <span class="ct-pill">换题模拟</span>' : ''}</h4>
+      <p style="margin:0 0 4px">${fmtDT(e.endAt)}</p>
+      <p style="margin:0 0 4px">Rating ${e.oldRating} → <strong style="color:${band[1]}">${e.newRating}</strong>（${band[2]}）</p>
+      <p style="margin:0 0 4px">本场变化 <strong class="${deltaClass(e.delta)}">${signed(e.delta)}</strong></p>
+      ${e.rank != null ? `<p style="margin:0 0 6px">本场名次 第 ${e.rank} 名，共 ${(e.referenceCount ?? 0) + 1} 人</p>` : ''}
+      <button data-open="${e.runId}">查看本场详情</button>`;
+    tip.classList.remove('ct-hidden');
+    const rect = node.getBoundingClientRect(), box = chart.getBoundingClientRect();
+    let left = rect.left - box.left + rect.width / 2 - tip.offsetWidth / 2;
+    left = Math.max(4, Math.min(left, chart.clientWidth - tip.offsetWidth - 4));
+    let top = rect.top - box.top - tip.offsetHeight - 8;
+    if (top < 2) top = rect.top - box.top + rect.height + 8;
+    tip.style.left = `${Math.round(left)}px`;
+    tip.style.top = `${Math.round(top)}px`;
+    if (pin) ratingTipPinned = i;
+  }
+  function hideRatingTip() {
+    const tip = $('rating-tip');
+    if (tip) tip.classList.add('ct-hidden');
+    ratingTipPinned = -1;
+  }
+  function bindRatingChart() {
+    const chart = $('rating-chart');
+    if (!chart) return;
+    chart.onclick = e => {
+      const n = e.target.closest('[data-node]');
+      if (n) showRatingTip(Number(n.dataset.node), n, true);
+      else hideRatingTip();
+    };
+    chart.onpointerover = e => {
+      const n = e.target.closest('[data-node]');
+      if (n && matchMedia('(hover: hover)').matches && ratingTipPinned < 0) showRatingTip(Number(n.dataset.node), n, false);
+    };
+    chart.onpointerout = e => {
+      const n = e.target.closest('[data-node]');
+      if (n && ratingTipPinned < 0) hideRatingTip();
+    };
+  }
+  window.addEventListener('resize', () => {
+    if (!ratingSnapshot) return;
+    clearTimeout(ratingTimer);
+    ratingTimer = setTimeout(() => { hideRatingTip(); drawRatingChart(); }, 150);
+  });
+  function renderSeen() {
+    const host = $('seen-list');
+    if (!host) return;
+    const notices = data.notices || [];
+    host.innerHTML = notices.length ? `<p class="ct-muted">我手动补充的接触记录：</p>${notices.map(n => {
+      const contest = n.key.startsWith('contest:');
+      const value = contest ? n.key.slice(8) : n.key;
+      return `<div class="ct-flex"><span>${contest ? '比赛' : '题目'} ${esc(value)}</span><button type="button" class="secondary" data-unsee-kind="${contest ? 'contest' : 'problem'}" data-unsee-value="${esc(value)}">删除</button></div>`;
+    }).join('')}` : '<p class="ct-muted">尚未手动补充接触记录。</p>';
+  }
+  async function loadProblems() {
+    const host = $('problems');
+    if (!host) return;
+    const seq = ++problemsSeq;
+    const mine = data.accounts.find(a => a.uid === data.uid);
+    if (problemListBinding !== (mine?.bindingId ?? null)) {
+      problemListBinding = mine?.bindingId ?? null;
+      problemPage = 1;
+      host.innerHTML = '<p class="ct-muted">题目记录加载中…</p>';
+    }
+    if (!mine) {
+      host.innerHTML = '<p class="ct-muted">绑定 CF 账号并同步后显示题目记录。</p>';
+      return;
+    }
+    const status = problemStatus, page = problemPage;
+    try {
+    const result = await api('problems', { status, page });
+    if (seq !== problemsSeq) return;
+    problemPage = result.page;
+    const labels = { all: '全部', solved: '已通过', attempted: '尝试过的题目' };
+    const tabs = ['all', 'solved', 'attempted'].map(value => `<button type="button" data-problem-status="${value}" class="${value === result.status ? '' : 'secondary'}" aria-pressed="${value === result.status}">${labels[value]}（${result.counts[value]}）</button>`).join('');
+    const rows = result.rows.length ? `<div class="ct-scroll"><table><thead><tr><th>题目</th><th>状态</th><th>提交数</th><th>最近提交</th></tr></thead><tbody>${result.rows.map(p => {
+      const href = p.contestId >= 100000 ? `https://codeforces.com/gym/${p.contestId}/problem/${encodeURIComponent(p.index)}`
+        : `https://codeforces.com/problemset/problem/${p.contestId}/${encodeURIComponent(p.index)}`;
+      return `<tr><td><a href="${href}" target="_blank" rel="noopener">${esc(p.key)} ${esc(p.name)}</a>${p.rating ? `<br><small>难度 ${p.rating}</small>` : ''}</td><td>${labels[p.status]}</td><td>${p.submissions}</td><td>${esc(when(p.lastSubmittedAt))}</td></tr>`;
+    }).join('')}</tbody></table></div>` : '<p class="ct-muted">当前分类还没有题目。</p>';
+    host.innerHTML = `<div class="ct-flex">${tabs}</div>${rows}<div class="ct-flex"><span>第 ${result.page} / ${result.pages} 页</span><button type="button" class="secondary" data-problem-page="${result.page - 1}" ${result.page === 1 ? 'disabled' : ''}>上一页</button><button type="button" class="secondary" data-problem-page="${result.page + 1}" ${result.page === result.pages ? 'disabled' : ''}>下一页</button></div>`;
+    } catch (e) {
+      if (seq !== problemsSeq) return;
+      host.innerHTML = `<p class="ct-error">题目记录加载失败：${esc(e.message)}。请刷新重试。</p>`;
+    }
+  }
+  function clearProblemStats(messageText) {
+    problemStatsSnapshot = null;
+    problemStatsTipPinned = null;
+    const host = $('problem-stats');
+    if (host) host.innerHTML = `<p class="${messageText.includes('失败') ? 'ct-error' : 'ct-muted'}">${esc(messageText)}</p>`;
+  }
+  async function loadProblemStats() {
+    const host = $('problem-stats');
+    if (!host) return;
+    const seq = ++problemStatsSeq;
+    const mine = data.accounts.find(a => a.uid === data.uid);
+    if (!mine) {
+      clearProblemStats('绑定 CF 账号并同步后显示统计。');
+      return;
+    }
+    if (problemStatsSnapshot && problemStatsSnapshot.account.bindingId !== mine.bindingId) {
+      clearProblemStats('账号已更换，正在加载新账号的统计。');
+    }
+    try {
+      const result = await api('problem_stats');
+      if (seq !== problemStatsSeq) return;
+      if (!result.account || result.account.bindingId !== mine.bindingId) throw new Error('账号信息已变化，请刷新后重试');
+      if (problemStatsSnapshot && problemStatsSnapshot.account.bindingId !== result.account.bindingId) {
+        problemStatsTipPinned = null;
+      }
+      problemStatsSnapshot = result;
+      renderProblemStats();
+    } catch (e) {
+      if (seq !== problemStatsSeq) return;
+      clearProblemStats(`统计加载失败：${e.message}。请刷新重试。`);
+    }
+  }
+  function statColor(tag) {
+    if (tag == null) return '#9aa5b1';
+    const colors = ['#247ba0','#70c1b3','#f3a712','#d1495b','#6c63a8','#47a025','#ed6a5a','#5c80bc','#a26769','#00a6a6','#f28482','#8ab17d'];
+    let hash = 2166136261;
+    for (let i = 0; i < tag.length; i++) hash = Math.imul(hash ^ tag.charCodeAt(i), 16777619);
+    return colors[(hash >>> 0) % colors.length];
+  }
+  function renderProblemStats() {
+    const host = $('problem-stats');
+    const stats = problemStatsSnapshot;
+    if (!host || !stats) return;
+    problemStatsTipPinned = null;
+    const account = stats.account;
+    const total = Number.isSafeInteger(stats.solvedTotal) ? stats.solvedTotal : 0;
+    const syncTime = account.lastSyncAt ? esc(when(account.lastSyncAt)) : '尚无成功同步记录';
+    const sync = account.lastSyncAt ? `上次成功同步 ${syncTime}` : '尚无成功同步记录';
+    const warnings = [];
+    if (!account.historyComplete) warnings.push('<p class="ct-error">统计尚不完整；当前结果可能只覆盖已同步的部分历史。</p>');
+    if (account.status === 'queued' || account.status === 'syncing') warnings.push(`<p class="ct-muted">历史正在${account.status === 'queued' ? '排队更新' : '更新'}；${sync}。</p>`);
+    if (account.status === 'failed') warnings.push(`<p class="ct-error">更新失败，统计可能不完整或过期。${sync}。</p>`);
+    const empty = total === 0 && account.status === 'ready' && account.historyComplete
+      ? '<p class="ct-muted">已同步记录中暂无已解决题目。</p>'
+      : '';
+    host.innerHTML = `<div class="ct-stats"><div class="ct-stat"><p class="ct-muted">CF 账号</p><strong>${esc(account.handle)}</strong></div><div class="ct-stat"><p class="ct-muted">已解决题目</p><strong>${total}</strong></div><div class="ct-stat"><p class="ct-muted">个人历史同步</p><strong>${syncTime}</strong></div><div class="ct-stat"><p class="ct-muted">题库资料同步</p><strong>${stats.catalogSyncedAt ? esc(when(stats.catalogSyncedAt)) : '暂无'}</strong></div></div>
+      <p class="ct-muted">基于已同步公开提交；一题可计入多个标签，标签占比以标签计数总和为分母。未知标签不表示没有算法知识点。</p>${warnings.join('')}${empty}
+      <div class="ct-problem-stats-grid"><section><h3>已解决题目难度分布</h3><div id="ct-stats-rating"></div></section><section><h3>已解决题目标签分布</h3><div id="ct-stats-tags"></div></section></div>`;
+    if (total > 0) {
+      drawProblemRating();
+      drawProblemTags();
+    } else {
+      $('stats-rating').innerHTML = '<p class="ct-muted">暂无可绘制的难度分布。</p>';
+      $('stats-tags').innerHTML = '<p class="ct-muted">暂无可绘制的标签分布。</p>';
+    }
+  }
+  function bindStatsItems(rootNode, rows, kind) {
+    for (const node of rootNode.querySelectorAll('[data-stats-index]')) {
+      const index = Number(node.dataset.statsIndex);
+      const show = pin => showProblemStatsTip(node, rows[index], kind, index, pin);
+      node.addEventListener('pointerenter', () => { if (problemStatsTipPinned == null) show(false); });
+      node.addEventListener('pointerleave', () => { if (problemStatsTipPinned == null) hideProblemStatsTip(rootNode); });
+      node.addEventListener('focus', () => show(false));
+      node.addEventListener('blur', () => { if (problemStatsTipPinned == null) hideProblemStatsTip(rootNode); });
+      node.addEventListener('click', () => show(true));
+      node.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); show(true); }
+        else if (e.key === 'Escape') { problemStatsTipPinned = null; hideProblemStatsTip(rootNode); node.blur(); }
+      });
+    }
+  }
+  function showProblemStatsTip(node, row, kind, index, pin) {
+    if (!row) return;
+    const chart = node.closest('.ct-stats-chart');
+    if (!chart) return;
+    root.querySelectorAll('.ct-stats-tip').forEach(existing => { if (existing.parentElement !== chart) existing.style.display = 'none'; });
+    let tip = chart.querySelector('.ct-stats-tip');
+    if (!tip) { tip = document.createElement('div'); tip.className = 'ct-stats-tip'; tip.setAttribute('role', 'status'); chart.appendChild(tip); }
+    const lines = kind === 'rating'
+      ? [`${row.label}: ${row.count} 道`, `${(row.count / problemStatsSnapshot.solvedTotal * 100).toFixed(1)}%（分母：全部 ${problemStatsSnapshot.solvedTotal} 道已解决题目）`]
+      : [`${row.kind === 'unknown' ? '无标签/标签未知' : row.tag}: ${row.count} 次`, `${(row.count / problemStatsSnapshot.tagDistribution.total * 100).toFixed(1)}%（标签计数总和 ${problemStatsSnapshot.tagDistribution.total}）`];
+    tip.replaceChildren(...lines.map(line => { const p = document.createElement('div'); p.textContent = line; return p; }));
+    tip.style.display = 'block';
+    const rect = node.getBoundingClientRect(), box = chart.getBoundingClientRect();
+    const scrollX = chart.scrollLeft;
+    const left = Math.max(scrollX + 4, Math.min(scrollX + rect.left - box.left + rect.width / 2 - tip.offsetWidth / 2, scrollX + chart.clientWidth - tip.offsetWidth - 4));
+    const top = Math.max(4, Math.min(rect.top - box.top - tip.offsetHeight - 7, chart.clientHeight - tip.offsetHeight - 4));
+    tip.style.left = `${Math.round(left)}px`; tip.style.top = `${Math.round(top)}px`;
+    if (pin) problemStatsTipPinned = `${kind}:${index}`;
+  }
+  function hideProblemStatsTip(rootNode) {
+    const tip = rootNode.querySelector('.ct-stats-tip');
+    if (tip) tip.style.display = 'none';
+  }
+  function drawProblemRating() {
+    const host = $('stats-rating'), stats = problemStatsSnapshot;
+    if (!host || !stats) return;
+    const nonzero = stats.rating.bins.filter(b => Number.isSafeInteger(b.min) && Number.isSafeInteger(b.count) && b.count > 0);
+    const bins = [];
+    if (nonzero.length) for (let min = nonzero[0].min; min <= nonzero[nonzero.length - 1].min; min += 100) {
+      bins.push({ min, max: min + 99, count: nonzero.find(b => b.min === min)?.count || 0, label: `${min}–${min + 99}` });
+    }
+    if (stats.rating.unrated > 0) bins.push({ min: null, max: null, count: stats.rating.unrated, label: '未评级' });
+    if (!bins.length) { host.innerHTML = '<p class="ct-muted">暂无难度资料。</p>'; return; }
+    const maxCount = Math.max(1, ...bins.map(b => b.count));
+    const width = Math.max(460, bins.length * 38), height = 225, left = 40, right = 12, top = 14, bottom = 42;
+    const plotH = height - top - bottom, plotW = width - left - right, slot = plotW / bins.length;
+    const ticks = [...new Set([0, Math.ceil(maxCount / 3), Math.ceil(maxCount * 2 / 3), maxCount])].sort((a,b)=>a-b);
+    const svg = [];
+    for (const tick of ticks) {
+      const y = top + plotH * (1 - tick / maxCount);
+      svg.push(`<line x1="${left}" x2="${width-right}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="#e6ecf1"/><text x="${left-7}" y="${(y+4).toFixed(1)}" text-anchor="end" font-size="11" fill="#65748b">${tick}</text>`);
+    }
+    bins.forEach((bin, i) => {
+      const barW = Math.max(12, slot * .64), x = left + i * slot + (slot - barW) / 2;
+      const barH = bin.count ? Math.max(1, plotH * bin.count / maxCount) : 0;
+      const y = top + plotH - barH;
+      const fill = bin.min == null ? '#9aa5b1' : bandOf(bin.min + 50)[1];
+      svg.push(`<rect data-stats-index="${i}" tabindex="0" role="button" aria-label="${esc(bin.label)}，${bin.count} 道题" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" fill="${fill}" rx="3"/>`);
+      svg.push(`<text x="${(left+i*slot+slot/2).toFixed(1)}" y="${height-19}" text-anchor="middle" font-size="10" fill="#526176">${bin.min == null ? '未评级' : bin.min}</text>`);
+    });
+    host.innerHTML = `<p class="ct-muted">纵轴为题数；Rating 按 100 分分档。</p><div class="ct-stats-chart ct-stats-bars-scroll" id="ct-stats-rating-chart"><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="group" aria-label="已解决题目的题目难度分布">${svg.join('')}</svg><div class="ct-stats-tip"></div></div><div class="ct-muted">${bins.map(b=>`${esc(b.label)}：${b.count} 道（${(b.count/stats.solvedTotal*100).toFixed(1)}%）`).join(' · ')}</div>`;
+    bindStatsItems(host, bins, 'rating');
+  }
+  function drawProblemTags() {
+    const host = $('stats-tags'), stats = problemStatsSnapshot;
+    if (!host || !stats) return;
+    const rows = stats.tagDistribution.rows.filter(r => Number.isSafeInteger(r.count) && r.count > 0);
+    if (!rows.length || !stats.tagDistribution.total) { host.innerHTML = '<p class="ct-muted">暂无标签分布。</p>'; return; }
+    const total = stats.tagDistribution.total, radius = 66, circumference = 2 * Math.PI * radius;
+    let offset = 0;
+    const arcs = rows.map((row, i) => {
+      const length = row.count / total * circumference, color = row.kind === 'unknown' ? '#9aa5b1' : statColor(row.tag);
+      const circle = `<circle data-stats-index="${i}" tabindex="0" role="button" aria-label="${esc(row.kind === 'unknown' ? '无标签/标签未知' : row.tag)}，${row.count} 次，占 ${((row.count/total)*100).toFixed(1)}%" cx="90" cy="90" r="${radius}" fill="none" stroke="${color}" stroke-width="25" stroke-dasharray="${length.toFixed(3)} ${(circumference-length).toFixed(3)}" stroke-dashoffset="${(-offset).toFixed(3)}" transform="rotate(-90 90 90)"/>`;
+      offset += length;
+      return circle;
+    }).join('');
+    const legend = rows.map((row, i) => {
+      const label = row.kind === 'unknown' ? '无标签/标签未知' : row.tag;
+      return `<div class="ct-stats-legend-row"><span class="ct-stats-swatch" style="background:${row.kind === 'unknown' ? '#9aa5b1' : statColor(row.tag)}"></span><span>${esc(label)}${row.kind === 'unknown' ? '<br><small class="ct-muted">不表示没有算法知识点</small>' : ''}</span><span>${row.count} · ${(row.count/total*100).toFixed(1)}%</span></div>`;
+    }).join('');
+    host.innerHTML = `<div class="ct-stats-ring-layout"><div class="ct-stats-chart" id="ct-stats-tags-chart"><svg class="ct-stats-ring" viewBox="0 0 180 180" role="group" aria-label="已解决题目的标签环形图，标签计数总和 ${total}">${arcs}<text x="90" y="85" text-anchor="middle" font-size="12" fill="#65748b">标签计数</text><text x="90" y="108" text-anchor="middle" font-size="20" font-weight="700" fill="#243248">${total}</text></svg><div class="ct-stats-tip"></div></div><div class="ct-stats-legend" aria-label="完整标签图例">${legend}</div></div>`;
+    bindStatsItems(host, rows, 'tag');
+  }
+  function classPreference(value) {
+    const storageKey = `cf-training-class:${root.dataset.api}:${data.uid}`;
+    try { if (value === undefined) return localStorage.getItem(storageKey) || ''; localStorage.setItem(storageKey, value); }
+    catch (_) { /* Browsers may disable local storage; switching still works in this visit. */ }
+    return '';
+  }
+  const parseMembers = value => String(value).split(/[,，\s]+/).filter(Boolean).map(x => {
+    if (!/^\d+$/.test(x) || Number(x) < 1 || Number(x) > 2147483647) throw new Error('学生 UID 必须是正整数');
+    return Number(x);
+  });
+  async function loadClassBoard() {
+    const seq = ++classSeq, id = selectedGroupId, host = $('class-board');
+    const group = data.groups.find(g => g.id === id);
+    if (!group || !(group.member || group.canManage)) { host.textContent = '暂无可查看的班级，请联系教练添加。'; return; }
+    host.textContent = '正在加载班级榜…';
+    try {
+      const result = await api('group_leaderboard', { id });
+      if (seq !== classSeq || selectedGroupId !== id) return;
+      host.innerHTML = (ratingPending(result) ? `<p class="ct-muted" role="status">${esc(ratingMessage(result))}</p>` : '') + (result.rows.length ? `<table><thead><tr><th>名次</th><th>Hydro UID / CF</th><th>本地 Rating</th><th>已解决题数</th><th>同步状态</th></tr></thead><tbody>${result.rows.map(r => `<tr${r.uid === data.uid ? ' style="background:#edf4f5"' : ''}><td>${r.rank ?? '—'}</td><td>${r.uid} / ${esc(r.handle || '未绑定')}${r.uid === data.uid ? '（我）' : ''}</td><td>${esc(ratingValue(r.rating, result))}</td><td>${r.solvedTotal ?? '—'}</td><td>${r.historyComplete ? '' : '部分数据 · '}${esc(statuses[r.status] || '未绑定')}<br><small>${esc(when(r.lastSyncAt))}</small></td></tr>`).join('')}</tbody></table>` : '<p class="ct-muted">该班级暂无学生。</p>');
+    } catch (e) { if (seq === classSeq) host.innerHTML = `<p class="ct-error">班级榜加载失败：${esc(e.message)}</p>`; }
+  }
+  const personName = uid => data.people?.find(p => p.uid === uid)?.uname || '用户';
+  const personLabel = uid => `${personName(uid)}（UID ${uid}）`;
+  const selectedClass = () => data.groups.find(g => g.id === selectedGroupId);
+  const contestClass = id => data.groups.find(g => g.id === id && g.canManage);
+  const contestClassKey = group => group && `${group.id}:${group.version}:${group.uids.join(',')}`;
+  function invalidateDiscovery(reason) {
+    ++discoverySeq;
+    discovery = null;
+    $('candidates').innerHTML = `<p class="ct-muted" role="status">${esc(reason)}</p>`;
+    $('pagination').innerHTML = '';
+  }
+  const discoveryCurrent = (seq, filters) => seq === discoverySeq && discovery === filters
+    && $('contest-group').value === filters.groupId
+    && contestClassKey(contestClass(filters.groupId)) === filters.classKey;
+  function renderClasses() {
+    data.groups ||= [];
+    if (!classPreferenceLoaded) { selectedGroupId = classPreference(); classPreferenceLoaded = true; }
+    const visible = data.groups.filter(g => g.member || g.canManage);
+    if (!visible.some(g => g.id === selectedGroupId)) selectedGroupId = (visible.find(g => g.member) || visible[0])?.id || '';
+    classPreference(selectedGroupId);
+    $('groups').innerHTML = '<option value="">选择班级</option>' + visible.map(g => `<option value="${esc(g.id)}">${esc(g.name)}（${g.uids.length}人）${g.ownerId ? '' : ' · 待指定所有者'}</option>`).join('');
+    $('groups').value = selectedGroupId;
+    const contestGroup = $('contest-group');
+    if (contestGroup) {
+      const contestGroupId = contestGroup.value;
+      const manageable = data.groups.filter(g => g.canManage);
+      contestGroup.innerHTML = '<option value="">选择班级</option>' + manageable.map(g => `<option value="${esc(g.id)}">${esc(g.name)}（${g.uids.length}人）</option>`).join('');
+      if (manageable.some(g => g.id === contestGroupId)) contestGroup.value = contestGroupId;
+      else contestGroup.value = manageable[0]?.id || '';
+      if (discovery && (discovery.groupId !== contestGroup.value
+        || discovery.classKey !== contestClassKey(contestClass(contestGroup.value)))) {
+        invalidateDiscovery(contestGroup.value ? '班级名单或权限已变化，请重新搜索当前班级。'
+          : '暂无可管理的班级，请联系班级所有者或域管理员授权。');
+      } else if (!contestGroup.value) {
+        invalidateDiscovery('暂无可管理的班级，请联系班级所有者或域管理员授权。');
+      } else if (!discovery && !$('candidates').textContent) {
+        invalidateDiscovery('请选择搜索条件并搜索当前班级比赛。');
+      }
+    }
+    const group = selectedClass();
+    $('class-new').classList.toggle('ct-hidden', !(data.isCoach || data.isDomainAdmin));
+    $('class-editor').classList.toggle('ct-hidden', !group?.canManage);
+    $('group').elements.name.value = group?.name || '';
+    $('group').dataset.version = group?.version || 0;
+    $('class-members-add').reset();
+    $('class-members').innerHTML = group?.canManage && group.uids.length ? `<table><thead><tr><th><input type="checkbox" id="ct-class-member-all" aria-label="选择所有学生"></th><th>学生</th><th>操作</th></tr></thead><tbody>${group.uids.map(uid => `<tr><td><input type="checkbox" data-class-member="${uid}" aria-label="选择 UID ${uid}"></td><td>${esc(personLabel(uid))}</td><td><button type="button" class="secondary" data-remove-member="${uid}">移除</button></td></tr>`).join('')}</tbody></table>` : '<p class="ct-muted">暂无学生，可通过 UID 添加。</p>';
+    $('class-remove-selected').disabled = true;
+    $('class-admins').innerHTML = group?.canManage ? (group.ownerId ? `<div class="ct-person"><span>${esc(personLabel(group.ownerId))}</span><span class="ct-pill">所有者</span></div>` : '<p class="ct-muted">旧班级未记录创建者，请域管理员指定所有者。</p>') + (group.adminIds || []).map(uid => `<div class="ct-person"><span>${esc(personLabel(uid))} <span class="ct-pill">管理员</span></span>${group.canOwn ? `<button type="button" class="secondary" data-remove-admin="${uid}">移除</button>` : ''}</div>`).join('') + (!(group.adminIds || []).length ? '<p class="ct-muted">暂无其他管理员。</p>' : '') : '';
+    $('class-owner').innerHTML = group?.canOwn ? `<form id="ct-class-admin" class="ct-flex"><label>管理员 UID <input name="uid" type="number" min="1" required></label><button>添加管理员</button></form>${group.transfer ? `<p>等待 ${esc(personLabel(group.transfer.to))} 接收 <button type="button" class="secondary" data-class-action="group_transfer_cancel" data-class-id="${esc(group.id)}">取消转让</button></p>` : ''}${data.isDomainAdmin ? '<details><summary>域管理员：恢复班级所有者</summary><form id="ct-class-claim" class="ct-flex"><label>所有者 UID <input name="uid" type="number" min="1" required></label><button>指定 / 恢复所有者</button></form></details>' : ''}` : '';
+    $('class-transfer-open').classList.toggle('ct-hidden', !group?.canOwn);
+    $('class-transfer-open').disabled = !group?.ownerId || !!group?.transfer;
+    $('delete-group').classList.toggle('ct-hidden', !group?.canOwn);
+    $('delete-group').disabled = !group?.canOwn;
+    $('class-invites').innerHTML = data.groups.filter(g => g.transfer?.to === data.uid).map(g => `<p>UID ${g.transfer.from} 邀请你接收班级“${esc(g.name)}”。接收后原所有者成为管理员。 <button type="button" data-class-action="group_transfer_accept" data-class-id="${esc(g.id)}" data-transfer-id="${esc(g.transfer.id)}">接收班级</button> <button type="button" class="secondary" data-class-action="group_transfer_reject" data-class-id="${esc(g.id)}" data-transfer-id="${esc(g.transfer.id)}">拒绝</button></p>`).join('');
+    void loadClassBoard();
+  }
+  function closeClassDialog() { $('class-dialog').close(); }
+  $('class-dialog').addEventListener('close', () => { dialogState = null; dialogSeq++; });
+  function openClassDialog(kind) {
+    const g = selectedClass();
+    const state = { kind, id: g?.id, seq: ++dialogSeq, selectedUid: null };
+    const cancel = '<button type="button" data-dialog-cancel class="secondary">取消</button>';
+    let html, title;
+    if (kind === 'new') {
+      title = '新建班级';
+      html = `<p class="ct-muted">创建后，你将成为班级所有者，可继续添加管理员和维护成员。</p><form id="ct-class-create"><label>班级名称 <input name="name" required maxlength="100" autofocus placeholder="例如：周末提高班"></label><label>初始学生 UID（可选）<input name="members" placeholder="多个 UID 用逗号分隔"></label>${data.isCoach ? '<button type="button" id="ct-class-create-copy" class="secondary">填入学生管理所选学生</button>' : ''}<p class="ct-muted">学生须先绑定 CF 账号，每班最多 100 人；留空可先创建空班级。</p><p>所有者：${esc(personLabel(data.uid))}</p><div class="ct-dialog-actions">${cancel}<button>创建班级</button></div></form>`;
+    } else if (kind === 'bulk') {
+      state.uids = uids();
+      const targets = data.groups.filter(x => x.canManage);
+      if (!targets.length) throw new Error('暂无可管理的班级，请先新建班级或联系所有者授权');
+      title = '添加到班级';
+      html = `<p>已选择 ${state.uids.length} 名学生：${state.uids.map(uid => esc(personLabel(uid))).join('、')}</p><form id="ct-class-bulk-form"><p class="ct-muted">请选择一个或多个班级。已在班级中的学生不会重复添加。</p>${targets.map(x => `<label><input type="checkbox" name="ids" value="${esc(x.id)}"> ${esc(x.name)}（${x.uids.length}人）</label>`).join('')}<div class="ct-dialog-actions">${cancel}<button>确认添加</button></div></form>`;
+    } else {
+      if (!g?.canOwn || !g.ownerId) throw new Error('无权转让当前班级');
+      title = `转让班级：${g.name}`;
+      html = `<p class="ct-muted">请选择另一位接收者。对方确认接收后，你将成为班级管理员。</p>${(g.adminIds || []).length ? `<label>从当前管理员选择 <select id="ct-transfer-candidate"><option value="">请选择接收者</option>${g.adminIds.map(uid => `<option value="${uid}">${esc(personLabel(uid))}</option>`).join('')}</select></label>` : '<p class="ct-muted">当前没有其他管理员，可通过 UID 查找域内用户。</p>'}<form id="ct-transfer-lookup" class="ct-flex"><label>查找其他用户 UID <input name="uid" type="number" min="1" required></label><button>查找</button></form><div id="ct-transfer-preview" aria-live="polite"></div><form id="ct-class-transfer"><div class="ct-dialog-actions">${cancel}<button id="ct-transfer-confirm" disabled>确认发起转让</button></div></form>`;
+    }
+    dialogState = state;
+    $('class-dialog-title').textContent = title;
+    $('dialog-body').innerHTML = html;
+    $('dialog-error').classList.add('ct-hidden');
+    $('class-dialog').showModal();
+  }
+  async function lookupTransfer(uid) {
+    const context = dialogState, seq = ++dialogSeq;
+    context.selectedUid = null;
+    $('transfer-confirm').disabled = true;
+    $('transfer-preview').textContent = '正在核对接收者…';
+    try {
+      const user = await api('group_user', { id: context.id, uid });
+      if (dialogState !== context || seq !== dialogSeq) return;
+      if (user.uid === data.groups.find(g => g.id === context.id)?.ownerId) throw new Error('请选择当前所有者以外的用户');
+      context.selectedUid = user.uid;
+      $('transfer-preview').innerHTML = `<p class="ct-success">接收者：${esc(user.uname || '用户')}（UID ${user.uid}）</p>`;
+      $('dialog-error').classList.add('ct-hidden');
+      $('transfer-confirm').disabled = false;
+    } catch (e) {
+      if (dialogState !== context || seq !== dialogSeq) return;
+      $('transfer-preview').innerHTML = `<p class="ct-error">${esc(e.message)}</p>`;
+    }
+  }
+  async function removeClassMembers(uids) {
+    if (!uids.length) throw new Error('请先选择要移除的学生');
+    const g = selectedClass();
+    if (!window.confirm(`从“${g.name}”移除 ${uids.length} 名学生？其他班级和已有训练不受影响。`)) return;
+    await api('group_members', { ids: [g.id], uids, mode: 'remove' }, true);
+    await refresh(); message('学生已从当前班级移除');
+  }
+  async function refresh() {
+    const seq = ++refreshSeq;
+    const result = await api('dashboard');
+    if (seq !== refreshSeq) return;
+    data = result;
+    if (data.isCoach !== (root.dataset.coach === 'true')) { location.replace(root.dataset.entry); return; }
+    if (!data.isCoach) {
+    const mine = data.accounts.find(a => a.uid === data.uid);
+    $('bind').classList.toggle('ct-hidden', !!mine);
+    $('account').innerHTML = mine ? `<div class="ct-flex"><strong>${esc(mine.handle)}</strong><span class="ct-pill">${mine.approved?'教练已确认':'待教练确认'}</span><span>${esc(statuses[mine.status] || mine.status)} · 已扫描 ${mine.scanned || 0} 条记录</span><button data-action="sync" data-uid="${mine.uid}" class="secondary">刷新历史</button></div><p class="ct-muted">历史${mine.historyComplete?'同步完整':'尚未同步完整'} · 上次成功 ${esc(when(mine.lastSyncAt))}</p>${mine.error?`<p class="ct-error">${esc(mine.error)}</p>`:''}<p>本地 Rating <strong class="ct-score">${esc(ratingValue(mine.rating))}</strong></p><p class="ct-muted">${esc(baselineLabel(mine))}</p>` : '<p>尚未绑定账号。</p>';
+    renderSeen();
+    void loadProblems();
+    void loadProblemStats();
+    renderRating(mine);
+    }
+    $('runs').innerHTML = data.runs.length ? `<table><thead><tr><th>训练</th><th>时间</th><th>状态</th><th></th></tr></thead><tbody>${data.runs.slice().reverse().map(r => `<tr><td>${esc(r.title)} ${r.changed?'<span class="ct-pill">换题模拟</span>':''}<br><small>${r.rated?'计分':'练习'} · ${Math.round(r.durationSeconds/60)} 分钟</small></td><td>${esc(when(r.startAt))}</td><td>${esc(statuses[r.status])}</td><td><button data-open="${r.id}">查看</button></td></tr>`).join('')}</tbody></table>` : '<p class="ct-muted">还没有训练场次。</p>';
+    if (data.isCoach) {
+      $('students').innerHTML = (ratingPending(data) ? `<p role="status">${esc(ratingMessage(data))}</p>` : '') + `<table><thead><tr><th>选择</th><th>Hydro UID / CF</th><th>历史同步</th><th>Rating</th><th>操作</th></tr></thead><tbody>${data.accounts.map(a => `<tr><td><input type="checkbox" data-select="${a.uid}" ${selected.has(a.uid)?'checked':''}></td><td>${a.uid} / ${esc(a.handle)}</td><td>${a.historyComplete?'完整':'未完成'} · ${esc(statuses[a.status] || a.status)}<br><small>${esc(when(a.lastSyncAt))}${a.error?' · '+esc(a.error):''}</small></td><td>${esc(ratingValue(a.rating))}<br><small>${esc(baselineLabel(a))}</small></td><td>${!a.approved?`<button data-action="approve" data-uid="${a.uid}">确认账号</button>`:''} <button class="secondary" data-action="sync" data-uid="${a.uid}">同步</button> <button class="secondary" data-rebind="${a.uid}">更换账号</button></td></tr>`).join('')}</tbody></table>`;
+      $('jobs').innerHTML = data.jobs.length ? data.jobs.map(j => `<p><span class="ct-pill">${esc(jobKinds[j.kind] || j.kind)}</span> ${esc(j.target || '目标信息不可用')} · ${esc(statuses[j.status] || j.status)}<br><small>最后更新：${j.updatedAt ? esc(when(j.updatedAt)) : '时间未知'}</small> ${j.error?`<span class="ct-error">${esc(j.error)}</span>`:''}</p>`).join('') : '<p class="ct-muted">没有后台任务。</p>';
+    }
+    renderClasses();
+    $('ledger').innerHTML = ratingPending(data) ? `<p role="status">${esc(ratingMessage(data))}</p>` : data.ledger.length ? data.ledger.map(e => `<h3>${esc(e.title)} ${e.changed?'· 换题模拟':''}</h3><table><thead><tr><th>学生</th><th>参照名次</th><th>赛前</th><th>变化</th><th>赛后</th></tr></thead><tbody>${e.changes.map(x => `<tr><td>${esc(x.handle)}</td><td>${x.rank} / ${x.referenceCount+1}</td><td>${x.oldRating}</td><td>${x.delta>=0?'+':''}${x.delta}</td><td>${x.newRating}</td></tr>`).join('')}</tbody></table>`).join('') : '<p class="ct-muted">尚无已结算的评分记录。</p>';
+  }
+  async function openRun(id) {
+    const seq = ++runSeq;
+    // Remove the previous detail and its action controls while loading: no write can
+    // target a run the user no longer sees, and late responses are dropped by the seq check.
+    currentRun = null; previewToken = null;
+    $('run-title').textContent = '加载中…';
+    $('run-body').innerHTML = '<p class="ct-muted" role="status">正在加载训练详情…</p>';
+    tab('detail');
+    let r;
+    try { r = await api('run', { id }); }
+    catch (e) {
+      if (seq !== runSeq) return;
+      $('run-title').textContent = '加载失败';
+      $('run-body').innerHTML = `<p class="ct-error">训练详情加载失败：${esc(e.message)}。请返回列表后重试。</p>`;
+      return;
+    }
+    if (seq !== runSeq) return;
+    currentRun = id;
+    $('run-title').textContent = r.run.title;
+    const run = r.run, coach = data.isCoach;
+    let html = `<p>${esc(when(run.startAt))} · ${run.durationSeconds/60} 分钟 · ${esc(statuses[run.status])} · ${run.rated?'计入本地 Rating':'练习赛'}</p>`;
+    html += `<p class="ct-muted" data-scoring-rules>${esc(ruleSummary(run.rules))}</p>`;
+    if (!coach && run.status === 'published') html += `<button data-action="attend">${run.attendees.includes(data.uid)?'已签到':'签到参赛'}</button> `;
+    html += '<button data-reload class="secondary">刷新本场</button>';
+    if (run.status === 'cancelled') html += `<p>此草稿已于 ${esc(when(run.cancelledAt))} 由教练 UID ${esc(run.cancelledBy)} 取消；保留在训练档案中，不再允许发布或结算。</p><p>原参赛名单：${run.members.map(m => `${esc(m.handle)}（${esc(m.uid)}）`).join('、') || '无'}</p>`;
+    else if (r.hidden) html += '<p class="ct-muted">题目将在开赛后显示。签到不会改变统一开赛时间。</p>';
+    else {
+      if (run.warnings) html += `<p class="ct-muted">${run.warnings.map(esc).join('<br>')}</p>`;
+      html += `<div class="ct-scroll"><table><thead><tr><th>位置</th><th>实际提交题目</th><th>基础分</th>${coach?'<th>换题</th>':''}</tr></thead><tbody>${run.slots.map(s => `<tr><td>${esc(s.index)}</td><td>${link(s.actual)}${coach?`<br><small>原题 ${esc(key(s.original))} · 难度 ${s.original.rating || '未知'} → ${s.actual.rating || '未知'}</small>`:''}</td><td>${s.points}</td>${coach?`<td>${run.status==='draft'?`<form data-replace="${esc(s.index)}" class="ct-flex"><input name="problem" required placeholder="替换题号"><button>替换</button><button type="button" class="secondary" data-suggest="${esc(s.index)}">找相近陌生题</button></form>`:'已锁定'}</td>`:''}</tr>`).join('')}</tbody></table></div><div id="ct-suggestions"></div>`;
+      if (coach) html += `<details><summary>参赛名单与练习资格</summary>${run.members.map(m => `<p>${esc(m.handle)}（${m.uid}） <label><input type="checkbox" data-practice="${m.uid}" ${m.practice?'checked':''} ${run.status==='settled'?'disabled':''}>仅练习，不更新 Rating</label></p>`).join('')}</details>`;
+      if (run.screening && coach) html += `<details><summary>发布时的旧题检查</summary>${run.screening.map(x=>`<p>UID ${x.uid}：${x.unknown?'未知':x.attended?'有参赛记录':x.touched.length?'接触过 '+esc(x.touched.join(', ')):'未发现接触记录'}</p>`).join('')}</details>`;
+      if (coach && run.status !== 'draft') html += `<details><summary>本场接触证据与误报纠正</summary><p>仅纠正所选证据，不改变签到、练习设置或同步要求。已结算训练须先撤销结算。后来发现的新证据需另行核对。</p>${[...r.rows, ...(r.absent || [])].map(row => {
+        const h = row.history || {}, corrections = h.corrections || [], corrected = new Set(corrections.flatMap(x => x.evidenceIds));
+        const sources = { manual:'个人自报', submission:'公开提交', participation:'公开参赛', rating:'Rated 参赛', publication:'旧发布快照（来源未细分）' };
+        return `<form data-correct-exposure="${row.uid}"><h4>${esc(row.handle)}（${row.uid}）</h4>${h.publicationMissing?'<p>缺少发布检查快照，仅使用现有可核实记录；此前已删除的记录无法恢复。</p>':''}${(h.evidence || []).map(e => `<p><label><input type="checkbox" name="evidenceIds" value="${esc(e.id)}" ${corrected.has(e.id)||run.status==='settled'?'disabled':''}>${esc(sources[e.source] || e.source)} · ${esc(e.key)} · ${esc(e.id)}${corrected.has(e.id)?'（已纠正）':''}</label></p>`).join('') || '<p>无已确认接触证据。</p>'}${run.status==='published' && (h.evidence || []).some(e => !corrected.has(e.id))?'<input name="reason" required maxlength="500" placeholder="误报纠正理由（必填）"><button>纠正所选证据</button>':''}${corrections.map(x => `<p>教练 UID ${x.actor} · ${esc(when(x.at))}：${esc(x.reason)}<br><small>覆盖：${x.evidenceIds.map(esc).join('；')}</small></p>`).join('')}</form>`;
+      }).join('')}</details>`;
+      html += `<h3>本场榜单</h3><div class="ct-scroll"><table><thead><tr><th>名次</th><th>学生</th><th>得分 / 罚时</th><th>逐题</th><th>状态</th></tr></thead><tbody>${r.rows.map(x => `<tr><td>${x.rank}</td><td>${esc(x.handle)}</td><td>${x.points} / ${x.penalty}</td><td>${x.problems.map(p=>`${esc(p.index)} ${p.solved?'✓ '+p.points:'—'}`).join(' · ')}</td><td>${x.reason?esc(x.reason)+' · ':''}${x.complete?'可结算':esc((x.completionIssues||[]).join('；')||'等待赛后同步')}</td></tr>`).join('')}</tbody></table></div>`;
+      if (coach) html += `${run.status==='draft'?`<form id="ct-reschedule-draft" class="ct-flex"><label>修改草稿开赛时间（本机时区） <input name="startAt" type="datetime-local" required></label><button>改期</button></form><p class="ct-muted">改期后须重新筛查并发布；取消记录仍占用单域 200 场存储上限。</p>`:''}<div class="ct-flex" style="margin-top:16px">${run.status==='draft'?(run.startAt>Date.now()?'<button data-action="publish">锁定题目并发布</button>':'<p>草稿已过开赛时间，请先改期。</p>')+'<button data-action="cancel_draft" class="secondary">取消草稿</button>':''}${['published','settled'].includes(run.status)?'<button data-action="refresh_run" class="secondary">同步本场所有学生</button>':''}${run.status==='published'?'<button data-preview>预览结算</button>':''}${run.status==='settled'?'<button data-action="void" class="secondary">撤销结算并重算后续</button>':''}</div><div id="ct-preview"></div>`;
+    }
+    $('run-body').innerHTML = html; tab('detail');
+  }
+  async function discover(page = 1) {
+    if (!discovery) return;
+    const filters = discovery, seq = ++discoverySeq;
+    if (!discoveryCurrent(seq, filters)) return;
+    $('candidates').innerHTML = '<p class="ct-muted" role="status">正在筛选当前班级比赛…</p>';
+    $('pagination').innerHTML = '';
+    let res;
+    try { res = await api('discover', {groupId:filters.groupId, query:filters.query,
+      mode:filters.mode, pageSize:filters.pageSize, page}); }
+    catch (e) {
+      if (discoveryCurrent(seq, filters)) $('candidates').innerHTML = `<p class="ct-error" role="status">筛选失败：${esc(e.message)}，请重新搜索。</p>`;
+      return;
+    }
+    if (!discoveryCurrent(seq, filters)) return;
+    const rows = res.rows;
+        $('candidates').innerHTML=rows.length?`<table><thead><tr><th>比赛</th><th>难度</th><th>接触情况</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${r.id} · ${esc(r.name)}<br>${r.durationSeconds/60} 分钟 · ${r.type}</td><td>${r.problems.map(p=>`${esc(p.index)}:${p.rating||'?'}`).join(' / ')}</td><td>未知 ${r.unknown} 人 · 参赛 ${r.attended} 人 · 需检查 ${r.touched} 题<details><summary>学生明细</summary>${r.conflicts.map(x=>`<p>UID ${x.uid}：${x.unknown?'未知':x.attended?'有参赛记录':x.touched.length?esc(x.touched.join(', ')):'无已知接触'}</p>`).join('')}</details></td></tr>`).join('')}</tbody></table>`:'<p>没有匹配比赛，请检查题库与学生历史是否已同步。</p>';
+
+    $('pagination').innerHTML = `<span>共 ${res.total} 场 · 第 ${res.page} / ${res.pages} 页</span> <button type="button" class="secondary" data-page="${res.page-1}" ${res.page===1?'disabled':''}>上一页</button> <button type="button" class="secondary" data-page="${res.page+1}" ${res.page===res.pages?'disabled':''}>下一页</button>`;
+  }
+  async function guarded(fn) { try { await fn(); } catch(e) { message(e.message, true); } }
+  root.addEventListener('change', e => {
+    if(e.target.dataset.select) { const uid=Number(e.target.dataset.select); e.target.checked?selected.add(uid):selected.delete(uid); }
+    if(e.target.dataset.practice) guarded(async()=>{await api('practice',{id:currentRun,uid:Number(e.target.dataset.practice),practice:e.target.checked},true);message('参赛资格已更新');});
+    if(e.target.id==='ct-groups') { selectedGroupId=e.target.value;renderClasses(); }
+    if(e.target.id==='ct-contest-group') invalidateDiscovery(e.target.value
+      ? '已切换参赛班级，请重新搜索；搜索条件已保留。'
+      : '请先选择参赛班级。');
+    if(e.target.id==='ct-transfer-candidate') guarded(async()=>{if(e.target.value)await lookupTransfer(Number(e.target.value));else {dialogState.selectedUid=null;++dialogSeq;$('transfer-confirm').disabled=true;$('transfer-preview').textContent='请选择接收者';}});
+    if(e.target.id==='ct-class-member-all') root.querySelectorAll('[data-class-member]').forEach(x=>{x.checked=e.target.checked;});
+    if(e.target.id==='ct-class-member-all' || e.target.hasAttribute('data-class-member')) $('class-remove-selected').disabled=!root.querySelector('[data-class-member]:checked');
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && problemStatsTipPinned != null) {
+      problemStatsTipPinned = null;
+      root.querySelectorAll('.ct-stats-chart').forEach(hideProblemStatsTip);
+    }
+  });
+  document.addEventListener('click', e => {
+    if (problemStatsTipPinned != null && !e.target.closest('#ct-problem-stats-card [data-stats-index]')) {
+      problemStatsTipPinned = null;
+      root.querySelectorAll('.ct-stats-chart').forEach(hideProblemStatsTip);
+    }
+  });
+  window.addEventListener('resize', () => {
+    if (!problemStatsSnapshot) return;
+    clearTimeout(problemStatsTimer);
+    problemStatsTimer = setTimeout(renderProblemStats, 160);
+  });
+  root.addEventListener('click', e => {
+    const b=e.target.closest('button'); if(!b) return;
+    guarded(async()=>{
+      if(b.dataset.tab) tab(b.dataset.tab);
+      else if(b.id==='ct-class-new') openClassDialog('new');
+      else if(b.id==='ct-add-to-classes') openClassDialog('bulk');
+      else if(b.id==='ct-class-transfer-open') openClassDialog('transfer');
+      else if(b.id==='ct-dialog-close' || b.hasAttribute('data-dialog-cancel')) closeClassDialog();
+      else if(b.id==='ct-class-create-copy') $('class-create').elements.members.value=uids().join(', ');
+      else if(b.dataset.removeAdmin) {
+        const uid=Number(b.dataset.removeAdmin),g=selectedClass();
+        if(!window.confirm(`撤销 ${personLabel(uid)} 对“${g.name}”的管理员权限？`))return;
+        await api('group_admin',{id:g.id,uid,mode:'remove'},true);await refresh();message('管理员权限已撤销');
+      }
+      else if(b.dataset.removeMember) await removeClassMembers([Number(b.dataset.removeMember)]);
+      else if(b.id==='ct-class-remove-selected') await removeClassMembers([...root.querySelectorAll('[data-class-member]:checked')].map(x=>Number(x.dataset.classMember)));
+      else if(b.id==='ct-class-refresh') await loadClassBoard();
+      else if(b.dataset.classAction) {
+        b.disabled=true;
+        try { await api(b.dataset.classAction,{id:b.dataset.classId,transferId:b.dataset.transferId},true);await refresh();message('班级权限已更新'); }
+        finally { b.disabled=false; }
+      }
+      else if(b.dataset.problemStatus) { problemStatus=b.dataset.problemStatus;problemPage=1;await loadProblems(); }
+      else if(b.dataset.problemPage) { problemPage=Number(b.dataset.problemPage);await loadProblems(); }
+      else if(b.dataset.page) { b.disabled=true; try { await discover(Number(b.dataset.page)); } finally { b.disabled=false; } }
+      else if(b.dataset.unseeKind) {await api('unsee',{kind:b.dataset.unseeKind,value:b.dataset.unseeValue},true);await refresh();message('手动接触记录已删除');}
+      else if(b.dataset.rebind) {
+        const a=data.accounts.find(x=>x.uid===Number(b.dataset.rebind));
+        const handle=window.prompt(`更换 UID ${a.uid} 的 CF 账号（当前 ${a.handle}）。换绑后重新同步并确认，保留本地 Rating。`, '');
+        if(handle===null) return;
+        await api('rebind',{uid:a.uid,handle},true); await refresh(); message('账号已更换，正在重新同步；完成后请确认账号归属');
+      }
+      else if(b.id==='ct-refresh') await refresh();
+      else if(b.id==='ct-delete-group') {
+        const group=data.groups.find(g=>g.id===selectedGroupId);
+        if(!group) return;
+        if(!window.confirm(`删除班级“${group.name}”？已创建的训练不受影响。`)) return;
+        await api('delete_group',{id:group.id},true);
+        selectedGroupId='';await refresh();message('班级已删除');
+      }
+      else if(b.id==='ct-back') tab('home');
+      else if(b.dataset.open) await openRun(b.dataset.open);
+      else if(b.hasAttribute('data-reload')) { if (currentRun) await openRun(currentRun); }
+      else if(b.dataset.action) {
+        if(b.dataset.action==='cancel_draft' && !window.confirm('取消此草稿？记录会保留并继续占用存储上限，成员可在无其他有效训练时换绑。'))return;
+        b.disabled=true;
+        try { await api(b.dataset.action,{id:currentRun,uid:b.dataset.uid?Number(b.dataset.uid):undefined},true);message('操作完成');await refresh();if(currentRun && !['approve','sync'].includes(b.dataset.action))await openRun(currentRun); }
+        finally { b.disabled=false; }
+      } else if(b.id==='ct-catalog') {await api('catalog',{},true);message('题库同步已进入后台队列');}
+      else if(b.id==='ct-sync-all') {for(const uid of uids())await api('sync',{uid},true);message('所选学生已加入同步队列');}
+      else if(b.dataset.suggest) {
+        const runId=currentRun, seq=runSeq;
+        const res=await api('replacements',{id:runId,index:b.dataset.suggest});
+        if (seq !== runSeq || runId !== currentRun || !$('suggestions')) return;
+        $('suggestions').innerHTML=`<p class="ct-muted">${res.unknown?'部分历史不完整，候选仍需核实。':'按当前历史未发现接触记录。'} 相近难度不保证等价，教练应核对实现量与知识点。</p>`+res.problems.map(p=>`<p>${link(p)} · ${p.rating} · ${esc((p.tags||[]).join(', '))}</p>`).join('');
+      } else if(b.hasAttribute('data-preview')) {
+        const runId=currentRun, seq=runSeq;
+        b.disabled=true;
+        try {const p=await api('preview',{id:runId});
+          if (seq !== runSeq || runId !== currentRun || !$('preview')) return;
+          previewToken=p.token;
+          if (ratingPending(p)) { $('preview').innerHTML = `<p role="status">${esc(ratingMessage(p))}，完成后请再次点击预览结算。</p>`; return; }
+          $('preview').innerHTML=`<p>${p.complete?'本场可结算':'本场尚不可结算'}</p>`+p.rows.filter(x=>x.checked&&!x.complete).map(x=>`<p>${esc(x.handle)}：${esc((x.completionIssues||[]).join('；'))}</p>`).join('')+p.changes.map(x=>`<p>${esc(x.handle)}：参照 ${x.rank}/${x.referenceCount+1}，${x.oldRating} → ${x.newRating}（${x.delta>=0?'+':''}${x.delta}）</p>`).join('')+`<button data-commit ${!p.complete||Date.now()<p.event.endAt?'disabled':''}>确认此次结算</button>`;
+        } finally{b.disabled=false;}
+      } else if(b.hasAttribute('data-commit')) {await api('settle',{id:currentRun,token:previewToken},true);message('已结算；历史评分将按时间顺序后台更新');await refresh();if(currentRun)await openRun(currentRun);}
+      else if(b.id==='ct-export') {const res=await api('export');const url=URL.createObjectURL(new Blob([JSON.stringify(res,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='cf-training-archive.json';a.click();URL.revokeObjectURL(url);}
+    });
+  });
+  root.addEventListener('submit',e=>{e.preventDefault();const f=e.target;const v=Object.fromEntries(new FormData(f));guarded(async()=>{
+    if (f.id === 'ct-discover') {
+      const groupId = $('contest-group').value, group = contestClass(groupId);
+      if (!group) { invalidateDiscovery('暂无可管理的班级，请先选择参赛班级。'); return; }
+      discovery = { groupId, classKey:contestClassKey(group), query:v.query, mode:v.mode, pageSize:v.pageSize };
+      await discover();
+      return;
+    }
+    const buttons=[...f.querySelectorAll('button')];buttons.forEach(b=>b.disabled=true);
+    try {
+      if(f.id==='ct-bind') await api('bind',v,true);
+      else if(f.dataset.correctExposure) {
+        const evidenceIds = new FormData(f).getAll('evidenceIds');
+        if (!evidenceIds.length) throw new Error('请选择要纠正的证据');
+        await api('correct_exposure',{id:currentRun,uid:Number(f.dataset.correctExposure),evidenceIds,reason:v.reason},true);
+        if (currentRun) await openRun(currentRun);
+      }
+      else if(f.id==='ct-seen') await api('seen',v,true);
+      else if(f.id==='ct-group') await api('group_rename',{id:selectedGroupId,version:Number(f.dataset.version),name:v.name},true);
+      else if(f.id==='ct-class-create') {
+        const result=await api('group',{name:v.name,uids:parseMembers(v.members)},true);
+        selectedGroupId=result.id;closeClassDialog();
+      }
+      else if(f.id==='ct-class-members-add') await api('group_members',{ids:[selectedGroupId],uids:parseMembers(v.members),mode:'add'},true);
+      else if(f.id==='ct-class-bulk-form') {
+        await api('group_members',{ids:[...f.querySelectorAll('[name=ids]:checked')].map(x=>x.value),uids:dialogState.uids,mode:'add'},true);
+        closeClassDialog();
+      }
+      else if(f.id==='ct-transfer-lookup') {await lookupTransfer(Number(v.uid));return;}
+      else if(f.id==='ct-class-transfer') {
+        if(!dialogState?.selectedUid)throw new Error('请先选择并核对接收者');
+        await api('group_transfer',{id:dialogState.id,uid:dialogState.selectedUid},true);closeClassDialog();
+      }
+      else if(['ct-class-admin','ct-class-claim'].includes(f.id)) {
+        const action=f.id==='ct-class-admin'?'group_admin':'group_claim';
+        if(action==='group_claim' && !window.confirm('指定所有者会取消待接收的转让。确定继续？'))return;
+        await api(action,{id:selectedGroupId,uid:Number(v.uid),mode:'add'},true);
+      }
+      else if(f.id==='ct-import') await api('import',v,true);
+      else if(f.id==='ct-create') {
+        if (!contestClass($('contest-group')?.value)) throw new Error('请先选择有权管理的参赛班级');
+        const res=await api('create',{title:v.title,contestId:v.contestId,startAt:new Date(v.startAt).toISOString(),rated:f.elements.rated.checked,groupId:$('contest-group').value,rules:{decayMinutes:v.decayMinutes,wrongPenalty:v.wrongPenalty,icpcPenalty:v.icpcPenalty}},true);
+        await refresh();await openRun(res.id);message('草稿已创建，可以换题并检查规则');return;
+      } else if(f.id==='ct-reschedule-draft') {
+        await api('reschedule_draft',{id:currentRun,startAt:new Date(v.startAt).toISOString()},true);
+        await refresh();if(currentRun)await openRun(currentRun);message('草稿已改期，请核对配置并重新发布');return;
+      } else if(f.dataset.replace) {await api('replace',{id:currentRun,index:f.dataset.replace,problem:v.problem},true);if(currentRun)await openRun(currentRun);}
+      message('操作完成；需要抓取的数据将在后台处理');await refresh();
+    }catch(e){if($('class-dialog').open){$('dialog-error').textContent=e.message;$('dialog-error').classList.remove('ct-hidden');}else throw e;}finally{buttons.forEach(b=>b.disabled=false);if($('transfer-confirm'))$('transfer-confirm').disabled=!dialogState?.selectedUid;}
+  });});
+  guarded(refresh);
+})();

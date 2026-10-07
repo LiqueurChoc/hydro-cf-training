@@ -1,0 +1,11 @@
+{
+  "name": "hydro-cf-training",
+  "version": "1.0.0-preview.2",
+  "private": true,
+  "description": "Codeforces replay training, history screening and local ratings for Hydro",
+  "main": "index.js",
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test test/*.test.js" },
+  "peerDependencies": { "hydrooj": ">=5.0.0 <6" }
+}
+
