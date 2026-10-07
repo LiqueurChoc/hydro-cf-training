@@ -1,6 +1,6 @@
 # Hydro CF 训练插件
 
-项目仓库：[LiqueurChoc/hydro-cf-training](https://github.com/LiqueurChoc/hydro-cf-training)（私有）。本目录是独立项目；早期记录中出现的 MyXCPCFile 路径与 Issue 指向仅为历史背景。
+项目仓库：[LiqueurChoc/hydro-cf-training](https://github.com/LiqueurChoc/hydro-cf-training)（私有）。本目录是独立项目，术语见[领域词汇](CONTEXT.md)；早期记录中出现的 MyXCPCFile 路径与 Issue 指向仅为历史背景。
 
 第一次接手请先读[项目接手指南](docs/project-guide.md)：从业务流程理解代码结构、数据与权限边界，再按需进入测试、部署和排障说明。
 
